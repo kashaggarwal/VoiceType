@@ -1,0 +1,9 @@
+mlx-whisper
+sounddevice
+numpy
+pyperclip
+pynput
+pillow
+pystray
+pyobjc-framework-Cocoa
+pyobjc-framework-Quartz

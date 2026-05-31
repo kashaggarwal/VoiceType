@@ -1,0 +1,15 @@
+venv/
+__pycache__/
+*.pyc
+*.pyo
+build/
+dist/
+*.spec
+.DS_Store
+/tmp/
+*.log
+scipy_stub/
+agent.md
+VoiceType.command
+voice_type.py
+setup.py
