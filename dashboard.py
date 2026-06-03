@@ -41,6 +41,10 @@ def _save_filler_words(words):
 # ── Persistent daily word-count stats ─────────────────────────────────────
 _STATS_PATH = os.path.expanduser("~/.voicetype/stats.json")
 
+# Single source of truth for the app version shown in the dashboard.
+# release.sh keeps this in sync with the git tag / app bundle version.
+VERSION = "1.3"
+
 def _load_daily_stats():
     try:
         with open(_STATS_PATH) as f:
@@ -74,7 +78,28 @@ def _calc_period_words(stats):
             tots["month"] += words
         if d >= year_start:
             tots["year"] += words
+    # Always include the per-month breakdown so every push site that sends
+    # period stats keeps the "By Month" strip populated (not just the initial
+    # load). Otherwise a live update after dictation would blank the strip.
+    tots["months"] = _calc_monthly_words(stats)
     return tots
+
+_MONTH_ABBR = ["JAN","FEB","MAR","APR","MAY","JUN",
+               "JUL","AUG","SEP","OCT","NOV","DEC"]
+
+def _calc_monthly_words(stats, limit=12):
+    """Total words per calendar month, most recent first (up to `limit` months)."""
+    months = {}
+    for date_str, words in stats.items():
+        try:
+            d = datetime.date.fromisoformat(date_str)
+        except ValueError:
+            continue
+        key = (d.year, d.month)
+        months[key] = months.get(key, 0) + words
+    ordered = sorted(months.keys(), reverse=True)[:limit]
+    return [{"label": _MONTH_ABBR[m - 1], "year": y, "words": months[(y, m)]}
+            for (y, m) in ordered]
 
 LANGUAGES = [
     ("English",     "en"),
@@ -287,7 +312,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     gap: 20px;
   }
 
-  .page { display: none; flex-direction: column; flex: 1; overflow: hidden; gap: 20px; }
+  .page { display: none; flex-direction: column; flex: 1; min-height: 0; overflow: hidden; gap: 20px; }
   .page.active { display: flex; }
 
   .welcome { font-size: 22px; font-weight: 700; letter-spacing: -0.4px; }
@@ -344,7 +369,15 @@ HTML_TEMPLATE = """<!DOCTYPE html>
   .stat-num { font-size: 22px; font-weight: 700; letter-spacing: -0.5px; color: var(--text); }
   .stat-label { font-size: 11px; color: var(--text-3); margin-top: 1px; }
 
-  .history-section { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .history-section { flex: 1; min-height: 0; display: flex; flex-direction: column; overflow: hidden; }
+
+  /* Home page scrolls as one unit (hero + stats + time-saved + history).
+     Without this, the taller time-saved card squeezes the history list to
+     zero height and the page can't scroll. The History tab keeps its own
+     inner-scroll behavior (overrides below are scoped to #page-home). */
+  #page-home { overflow-y: auto; overflow-x: hidden; }
+  #page-home .history-section { flex: none; }
+  #page-home .history-scroll { flex: none; overflow: visible; }
 
   .section-header {
     font-size: 11px;
@@ -573,6 +606,42 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     letter-spacing: 0.3px;
     opacity: 0.75;
   }
+
+  /* ── By-month strip ── */
+  .ts-months-wrap { margin-top: 12px; border-top: 1px solid #bbf7d0; padding-top: 10px; display: none; }
+  .ts-months-wrap.has-months { display: block; }
+  .ts-months-header {
+    font-size: 10px;
+    font-weight: 700;
+    color: #15803d;
+    text-transform: uppercase;
+    letter-spacing: 0.4px;
+    opacity: 0.75;
+    margin-bottom: 8px;
+  }
+  .ts-months-strip {
+    display: flex;
+    gap: 8px;
+    overflow-x: auto;
+    padding-bottom: 4px;
+    scrollbar-width: thin;
+  }
+  .ts-months-strip::-webkit-scrollbar { height: 4px; }
+  .ts-months-strip::-webkit-scrollbar-track { background: transparent; }
+  .ts-months-strip::-webkit-scrollbar-thumb { background: #86efac; border-radius: 2px; }
+  .ts-month {
+    flex: 0 0 auto;
+    min-width: 62px;
+    background: rgba(255,255,255,0.55);
+    border: 1px solid #bbf7d0;
+    border-radius: 9px;
+    padding: 8px 10px;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+  }
+  .ts-month-value { font-size: 14px; font-weight: 800; color: #16a34a; letter-spacing: -0.4px; line-height: 1.1; }
+  .ts-month-label { font-size: 9px; font-weight: 600; color: #15803d; margin-top: 3px; letter-spacing: 0.3px; opacity: 0.7; }
 
   /* ── Tone selector ── */
   .tone-row { display: flex; gap: 6px; flex-wrap: wrap; }
@@ -820,6 +889,10 @@ HTML_TEMPLATE = """<!DOCTYPE html>
           <div class="ts-label">This Year</div>
         </div>
       </div>
+      <div class="ts-months-wrap" id="ts-months-wrap">
+        <div class="ts-months-header">By Month</div>
+        <div class="ts-months-strip" id="ts-months-strip"></div>
+      </div>
     </div>
 
     <!-- Today's history -->
@@ -991,7 +1064,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         <div class="settings-card">
           <div class="settings-row">
             <div class="settings-row-label">VoiceType</div>
-            <span style="font-size:13px;color:var(--text-3);">v1.0</span>
+            <span style="font-size:13px;color:var(--text-3);">v__VERSION__</span>
           </div>
           <div class="settings-row">
             <div class="settings-row-label">Runs fully offline</div>
@@ -1264,6 +1337,26 @@ function updatePeriodStats(data) {
   if (wordsEl) {
     var todayWords2 = (data && data["today"]) ? data["today"] : 0;
     wordsEl.textContent = todayWords2.toLocaleString();
+  }
+
+  // By-month strip — one tile per calendar month that has data.
+  var monthsWrap  = document.getElementById("ts-months-wrap");
+  var monthsStrip = document.getElementById("ts-months-strip");
+  var months = (data && data["months"]) ? data["months"] : [];
+  if (monthsStrip && monthsWrap) {
+    var withData = months.filter(function(m) { return m.words > 0; });
+    if (withData.length > 0) {
+      monthsStrip.innerHTML = withData.map(function(m) {
+        return '<div class="ts-month">' +
+                 '<div class="ts-month-value">' + calcTimeSaved(m.words) + '</div>' +
+                 '<div class="ts-month-label">' + m.label + " " + m.year + '</div>' +
+               '</div>';
+      }).join("");
+      monthsWrap.classList.add("has-months");
+    } else {
+      monthsStrip.innerHTML = "";
+      monthsWrap.classList.remove("has-months");
+    }
   }
 }
 
@@ -2182,7 +2275,8 @@ class Dashboard:
         html = (HTML_TEMPLATE
                 .replace("__LANG_OPTIONS__", lang_options)
                 .replace("__LANG_MAP__", lang_map)
-                .replace("__FILLER_WORDS__", filler_json))
+                .replace("__FILLER_WORDS__", filler_json)
+                .replace("__VERSION__", VERSION))
 
         self._handler = _MessageHandler.alloc().initWithDashboard_(self)
         controller    = WKUserContentController.alloc().init()

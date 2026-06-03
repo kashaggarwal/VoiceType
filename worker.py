@@ -60,6 +60,19 @@ def _load_cfg():
 
 _cfg = _load_cfg()
 
+# If the model is already downloaded, force Hugging Face into offline mode so
+# loading uses the local cache and never hangs on a network round-trip to
+# huggingface.co (VoiceType runs fully offline once the model is present).
+# Only do this when the model is cached, so a brand-new model can still be
+# fetched on first use.
+def _model_is_cached(repo):
+    cache = os.path.expanduser("~/.cache/huggingface/hub")
+    return os.path.isdir(os.path.join(cache, "models--" + repo.replace("/", "--")))
+
+if _model_is_cached(MODEL):
+    os.environ["HF_HUB_OFFLINE"] = "1"
+    os.environ["TRANSFORMERS_OFFLINE"] = "1"
+
 import subprocess as _subprocess
 
 try:
