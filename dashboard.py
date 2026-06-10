@@ -16,9 +16,30 @@ import objc
 from Foundation import NSObject, NSMakeRect
 from WebKit import WKWebView, WKWebViewConfiguration, WKUserContentController
 
+# Shared text-processing (same module the worker uses) — for DEFAULT_PROFILES etc.
+import processing
+
 # ── Config helpers ────────────────────────────────────────────────────────
 _CONFIG_PATH = os.path.expanduser("~/.voicetype/config.json")
 _DEFAULT_FILLERS = ["um", "uh", "hmm", "hm", "er"]
+
+def _load_config_key(key, default):
+    try:
+        with open(_CONFIG_PATH) as f:
+            return json.load(f).get(key, default)
+    except Exception:
+        return default
+
+def _save_config_key(key, value):
+    os.makedirs(os.path.dirname(_CONFIG_PATH), exist_ok=True)
+    try:
+        with open(_CONFIG_PATH) as f:
+            cfg = json.load(f)
+    except Exception:
+        cfg = {}
+    cfg[key] = value
+    with open(_CONFIG_PATH, "w") as f:
+        json.dump(cfg, f, indent=2)
 
 def _load_filler_words():
     try:
@@ -43,7 +64,7 @@ _STATS_PATH = os.path.expanduser("~/.voicetype/stats.json")
 
 # Single source of truth for the app version shown in the dashboard.
 # release.sh keeps this in sync with the git tag / app bundle version.
-VERSION = "1.3"
+VERSION = "1.4"
 
 def _load_daily_stats():
     try:
@@ -118,6 +139,28 @@ LANGUAGES = [
 ]
 
 LANG_NAMES = {code: name for name, code in LANGUAGES}
+
+# Friendly names for app profiles (bundle id → label). Used for display and for
+# the "add app" dropdown. The seeded defaults plus common Mac apps.
+_APP_NAMES = {
+    "com.apple.mail":             "Mail",
+    "com.tinyspeck.slackmacgap":  "Slack",
+    "net.whatsapp.WhatsApp":      "WhatsApp",
+    "com.microsoft.VSCode":       "VS Code",
+    "com.apple.Safari":           "Safari",
+    "com.google.Chrome":          "Chrome",
+    "com.apple.Notes":            "Notes",
+    "com.apple.MobileSMS":        "Messages",
+    "notion.id":                  "Notion",
+    "md.obsidian":                "Obsidian",
+    "com.hnc.Discord":            "Discord",
+    "ru.keepcoder.Telegram":      "Telegram",
+    "com.microsoft.Word":         "Microsoft Word",
+    "com.apple.TextEdit":         "TextEdit",
+    "com.apple.dt.Xcode":         "Xcode",
+    "com.apple.Terminal":         "Terminal",
+    "com.googlecode.iterm2":      "iTerm",
+}
 
 HTML_TEMPLATE = """<!DOCTYPE html>
 <html lang="en" data-theme="auto">
@@ -507,6 +550,29 @@ HTML_TEMPLATE = """<!DOCTYPE html>
     cursor: pointer; font-family: inherit; white-space: nowrap;
   }
   .filler-add-btn:hover { background: #333; }
+
+  /* ── v1.4: shortcuts list ── */
+  .sc-row { display: flex; align-items: center; gap: 8px; padding: 7px 0; border-bottom: 1px solid var(--border); }
+  .sc-row:last-of-type { border-bottom: none; }
+  .sc-trigger { font-weight: 600; color: var(--text); font-family: monospace; font-size: 13px; }
+  .sc-arrow { color: var(--text-4); }
+  .sc-exp { flex: 1; color: var(--text-2); font-size: 13px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .sc-x { cursor: pointer; color: var(--text-3); font-size: 16px; padding: 0 4px; }
+  .sc-x:hover { color: #ef4444; }
+  .sc-add-row { display: flex; gap: 8px; align-items: center; margin-top: 10px; }
+  .sc-add-row .filler-input { flex: 1; }
+
+  /* ── v1.4: app profiles ── */
+  .prof-row { display: flex; align-items: center; gap: 10px; padding: 9px 0; border-bottom: 1px solid var(--border); }
+  .prof-row:last-of-type { border-bottom: none; }
+  .prof-name { flex: 1; font-size: 13px; font-weight: 500; color: var(--text); }
+  .prof-ctrl { display: flex; align-items: center; gap: 4px; font-size: 11px; color: var(--text-3); }
+  .prof-ctrl input[type=checkbox] { cursor: pointer; }
+  .prof-tone { border: 1px solid var(--border); border-radius: 7px; padding: 3px 6px; font-size: 12px;
+    background: var(--input-bg); color: var(--text); font-family: inherit; cursor: pointer; }
+  .prof-x { cursor: pointer; color: var(--text-3); font-size: 16px; padding: 0 2px; }
+  .prof-x:hover { color: #ef4444; }
+  .prof-default .prof-x { visibility: hidden; }
 
   /* ── Voice command reference ── */
   .cmd-table { width: 100%; border-collapse: collapse; }
@@ -1030,6 +1096,51 @@ HTML_TEMPLATE = """<!DOCTYPE html>
         </div>
       </div>
 
+      <!-- v1.4: Custom Vocabulary -->
+      <div class="settings-section">
+        <div class="settings-title">Custom Vocabulary</div>
+        <div class="settings-card">
+          <div class="filler-area" style="border-top:none;">
+            <div style="font-size:13px;font-weight:500;color:var(--text);margin-bottom:6px;">Custom Words</div>
+            <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">Names, brands, or terms VoiceType should recognize correctly</div>
+            <div class="filler-chips" id="vocab-chips"></div>
+            <div class="filler-add-row">
+              <input class="filler-input" id="vocab-input" placeholder="Add a word…"
+                onkeydown="if(event.key===&quot;Enter&quot;)addVocabWord()">
+              <button class="filler-add-btn" onclick="addVocabWord()">+ Add</button>
+            </div>
+          </div>
+          <div class="filler-area">
+            <div style="font-size:13px;font-weight:500;color:var(--text);margin-bottom:6px;">Shortcuts</div>
+            <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">Say the trigger phrase, type the full text</div>
+            <div id="sc-list"></div>
+            <div class="sc-add-row">
+              <input class="filler-input" id="sc-trigger" placeholder="Say this…" style="max-width:130px;"
+                onkeydown="if(event.key===&quot;Enter&quot;)addShortcut()">
+              <span class="sc-arrow">→</span>
+              <input class="filler-input" id="sc-exp" placeholder="Type this…"
+                onkeydown="if(event.key===&quot;Enter&quot;)addShortcut()">
+              <button class="filler-add-btn" onclick="addShortcut()">+ Add</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
+      <!-- v1.4: Per-App Profiles -->
+      <div class="settings-section">
+        <div class="settings-title">App Profiles</div>
+        <div class="settings-card">
+          <div class="filler-area" style="border-top:none;">
+            <div style="font-size:12px;color:var(--text-3);margin-bottom:10px;">How dictation is formatted in each app</div>
+            <div id="prof-list"></div>
+            <div class="sc-add-row">
+              <select class="prof-tone" id="prof-add-select" style="flex:1;"></select>
+              <button class="filler-add-btn" onclick="addProfile()">+ Add app</button>
+            </div>
+          </div>
+        </div>
+      </div>
+
       <div class="settings-section">
         <div class="settings-title">Voice Commands</div>
         <div class="settings-card">
@@ -1448,6 +1559,102 @@ function removeFillerWord(word) {
   window.webkit.messageHandlers.voicetype.postMessage({action: "removeFiller", word: word});
 }
 
+// ── v1.4: Custom vocabulary ────────────────────────────────────────────────
+function renderVocabulary(words) {
+  var box = document.getElementById("vocab-chips");
+  if (!box) return;
+  box.innerHTML = (words || []).map(function(w) {
+    var safe = escapeHtml(w);
+    return '<div class="filler-chip">' + safe + '<span class="filler-chip-x" onclick="removeVocabWord(&quot;' + safe + '&quot;)">×</span></div>';
+  }).join("");
+}
+function addVocabWord() {
+  var inp = document.getElementById("vocab-input");
+  var word = inp.value.trim();
+  if (!word) return;
+  inp.value = "";
+  window.webkit.messageHandlers.voicetype.postMessage({action: "addVocab", word: word});
+}
+function removeVocabWord(word) {
+  window.webkit.messageHandlers.voicetype.postMessage({action: "removeVocab", word: word});
+}
+
+// ── v1.4: Shortcuts ────────────────────────────────────────────────────────
+function renderShortcuts(map) {
+  var box = document.getElementById("sc-list");
+  if (!box) return;
+  var keys = Object.keys(map || {});
+  if (!keys.length) { box.innerHTML = '<div style="font-size:12px;color:var(--text-4);padding:4px 0;">No shortcuts yet</div>'; return; }
+  box.innerHTML = keys.map(function(k) {
+    var t = escapeHtml(k), e = escapeHtml(map[k]);
+    return '<div class="sc-row"><span class="sc-trigger">' + t + '</span><span class="sc-arrow">→</span>' +
+           '<span class="sc-exp">' + e + '</span>' +
+           '<span class="sc-x" onclick="removeShortcut(&quot;' + t + '&quot;)">×</span></div>';
+  }).join("");
+}
+function addShortcut() {
+  var ti = document.getElementById("sc-trigger"), ei = document.getElementById("sc-exp");
+  var t = ti.value.trim(), e = ei.value.trim();
+  if (!t || !e) return;
+  ti.value = ""; ei.value = "";
+  window.webkit.messageHandlers.voicetype.postMessage({action: "addShortcut", trigger: t, expansion: e});
+}
+function removeShortcut(trigger) {
+  window.webkit.messageHandlers.voicetype.postMessage({action: "removeShortcut", trigger: trigger});
+}
+
+// ── v1.4: App profiles ─────────────────────────────────────────────────────
+var APP_NAMES = __APP_NAMES__;
+function appLabel(bundle) {
+  if (bundle === "default") return "Everything else";
+  return APP_NAMES[bundle] || bundle;
+}
+function renderProfiles(profiles) {
+  var box = document.getElementById("prof-list");
+  if (!box) return;
+  // 'default' first, then the rest alphabetically by label.
+  var keys = Object.keys(profiles || {}).sort(function(a, b) {
+    if (a === "default") return -1; if (b === "default") return 1;
+    return appLabel(a).localeCompare(appLabel(b));
+  });
+  box.innerHTML = keys.map(function(app) {
+    var p = profiles[app];
+    var isDef = app === "default";
+    var cu = p.cleanup ? "checked" : "";
+    var pu = p.punctuate ? "checked" : "";
+    function opt(v, lbl) { return '<option value="' + v + '"' + (p.tone === v ? " selected" : "") + '>' + lbl + '</option>'; }
+    return '<div class="prof-row ' + (isDef ? "prof-default" : "") + '">' +
+      '<span class="prof-name">' + escapeHtml(appLabel(app)) + '</span>' +
+      '<label class="prof-ctrl"><input type="checkbox" ' + cu + ' onchange="setProfile(&quot;' + app + '&quot;,&quot;cleanup&quot;,this.checked)">clean</label>' +
+      '<label class="prof-ctrl"><input type="checkbox" ' + pu + ' onchange="setProfile(&quot;' + app + '&quot;,&quot;punctuate&quot;,this.checked)">punct</label>' +
+      '<select class="prof-tone" onchange="setProfile(&quot;' + app + '&quot;,&quot;tone&quot;,this.value)">' +
+        opt("none", "No tone") + opt("formal", "Formal") + opt("casual", "Casual") +
+      '</select>' +
+      '<span class="prof-x" onclick="removeProfile(&quot;' + app + '&quot;)">×</span>' +
+    '</div>';
+  }).join("");
+  // Rebuild the "add app" dropdown with apps not already configured.
+  var sel = document.getElementById("prof-add-select");
+  if (sel) {
+    var existing = {}; keys.forEach(function(k){ existing[k] = 1; });
+    var opts = Object.keys(APP_NAMES).filter(function(b){ return !existing[b]; })
+      .map(function(b){ return '<option value="' + b + '">' + escapeHtml(APP_NAMES[b]) + '</option>'; });
+    sel.innerHTML = opts.length ? opts.join("") : '<option value="">(all common apps added)</option>';
+  }
+}
+function setProfile(app, field, value) {
+  window.webkit.messageHandlers.voicetype.postMessage({action: "setProfile", app: app, field: field, value: value});
+}
+function addProfile() {
+  var sel = document.getElementById("prof-add-select");
+  var app = sel && sel.value;
+  if (!app) return;
+  window.webkit.messageHandlers.voicetype.postMessage({action: "addProfile", app: app});
+}
+function removeProfile(app) {
+  window.webkit.messageHandlers.voicetype.postMessage({action: "removeProfile", app: app});
+}
+
 // ── Command toast ─────────────────────────────────────────────────────────
 function showCmdToast(label) {
   var t = document.getElementById("cmd-toast");
@@ -1459,6 +1666,9 @@ function showCmdToast(label) {
 
 // ── Init ──────────────────────────────────────────────────────────────────
 renderFillerWords(__FILLER_WORDS__);
+renderVocabulary(__VOCAB__);
+renderShortcuts(__SHORTCUTS__);
+renderProfiles(__PROFILES__);
 </script>
 </body>
 </html>
@@ -1534,6 +1744,57 @@ class _MessageHandler(NSObject):
                 if self._db.on_filler_change:
                     self._db.on_filler_change(self._db.filler_words)
                 self._db.refresh_filler_ui()
+
+        # ── v1.4: custom vocabulary ──
+        elif action == "addVocab":
+            word = body.get("word", "").strip()
+            if word and word not in self._db.vocabulary:
+                self._db.vocabulary.append(word)
+                self._db._save_and_sync("vocabulary", self._db.vocabulary)
+                self._db.refresh_vocab_ui()
+        elif action == "removeVocab":
+            word = body.get("word", "").strip()
+            if word in self._db.vocabulary:
+                self._db.vocabulary.remove(word)
+                self._db._save_and_sync("vocabulary", self._db.vocabulary)
+                self._db.refresh_vocab_ui()
+
+        # ── v1.4: shortcuts ──
+        elif action == "addShortcut":
+            trigger = body.get("trigger", "").strip()
+            expansion = body.get("expansion", "").strip()
+            if trigger and expansion:
+                self._db.shortcuts[trigger] = expansion
+                self._db._save_and_sync("shortcuts", self._db.shortcuts)
+                self._db.refresh_shortcuts_ui()
+        elif action == "removeShortcut":
+            trigger = body.get("trigger", "")
+            if trigger in self._db.shortcuts:
+                del self._db.shortcuts[trigger]
+                self._db._save_and_sync("shortcuts", self._db.shortcuts)
+                self._db.refresh_shortcuts_ui()
+
+        # ── v1.4: per-app profiles ──
+        elif action == "addProfile":
+            app = body.get("app", "").strip()
+            if app and app not in self._db.app_profiles:
+                self._db.app_profiles[app] = {
+                    "cleanup": True, "punctuate": False, "tone": "none"}
+                self._db._save_and_sync("app_profiles", self._db.app_profiles)
+                self._db.refresh_profiles_ui()
+        elif action == "removeProfile":
+            app = body.get("app", "")
+            if app in self._db.app_profiles and app != "default":
+                del self._db.app_profiles[app]
+                self._db._save_and_sync("app_profiles", self._db.app_profiles)
+                self._db.refresh_profiles_ui()
+        elif action == "setProfile":
+            app = body.get("app", "")
+            field = body.get("field", "")
+            value = body.get("value")
+            if app in self._db.app_profiles and field in ("cleanup", "punctuate", "tone"):
+                self._db.app_profiles[app][field] = value
+                self._db._save_and_sync("app_profiles", self._db.app_profiles)
 
 
 class _WinDelegate(NSObject):
@@ -1698,6 +1959,15 @@ class Dashboard:
         # Filler words
         self.filler_words = _load_filler_words()
 
+        # v1.4 — custom vocabulary, shortcuts, per-app profiles
+        self.vocabulary = list(_load_config_key("vocabulary", []))
+        self.shortcuts  = dict(_load_config_key("shortcuts", {}))
+        self.app_profiles = dict(_load_config_key("app_profiles", {}))
+        if not self.app_profiles:
+            # Seed sensible defaults on first run so it works out of the box.
+            self.app_profiles = dict(processing.DEFAULT_PROFILES)
+            _save_config_key("app_profiles", self.app_profiles)
+
         # Callbacks
         self.on_toggle          = None
         self.on_stop            = None
@@ -1705,6 +1975,7 @@ class Dashboard:
         self.on_model_change    = None
         self.on_settings_change = None
         self.on_filler_change   = None
+        self.on_config_change   = None   # ping worker to re-read config
 
     # ── Public API ────────────────────────────────────────────────────────
 
@@ -1780,6 +2051,22 @@ class Dashboard:
 
     def refresh_filler_ui(self):
         self._js(f"renderFillerWords({json.dumps(self.filler_words)})")
+
+    # ── v1.4: settings persistence + UI refresh ───────────────────────────
+    def _save_and_sync(self, key, value):
+        """Persist a config key and tell the worker to re-read it live."""
+        _save_config_key(key, value)
+        if self.on_config_change:
+            self.on_config_change()
+
+    def refresh_vocab_ui(self):
+        self._js(f"renderVocabulary({json.dumps(self.vocabulary)})")
+
+    def refresh_shortcuts_ui(self):
+        self._js(f"renderShortcuts({json.dumps(self.shortcuts)})")
+
+    def refresh_profiles_ui(self):
+        self._js(f"renderProfiles({json.dumps(self.app_profiles)})")
 
     # ── Grammar fix ───────────────────────────────────────────────────────
 
@@ -2276,6 +2563,10 @@ class Dashboard:
                 .replace("__LANG_OPTIONS__", lang_options)
                 .replace("__LANG_MAP__", lang_map)
                 .replace("__FILLER_WORDS__", filler_json)
+                .replace("__APP_NAMES__", json.dumps(_APP_NAMES))
+                .replace("__VOCAB__", json.dumps(self.vocabulary))
+                .replace("__SHORTCUTS__", json.dumps(self.shortcuts))
+                .replace("__PROFILES__", json.dumps(self.app_profiles))
                 .replace("__VERSION__", VERSION))
 
         self._handler = _MessageHandler.alloc().initWithDashboard_(self)

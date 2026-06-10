@@ -491,6 +491,7 @@ _dash.on_language_change = _restart_with_lang
 _dash.on_model_change    = _restart_with_model
 _dash.on_settings_change = _restart_worker
 _dash.on_filler_change   = _on_filler_change
+_dash.on_config_change   = lambda: _send_to_worker("reload_config")
 
 
 # ── Edit menu ─────────────────────────────────────────────────────────────

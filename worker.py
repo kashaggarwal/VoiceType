@@ -75,6 +75,10 @@ if _model_is_cached(MODEL):
 
 import subprocess as _subprocess
 
+# Shared text-processing (vocabulary, shortcuts, profiles, tone). Same module
+# the dashboard uses, so the rules live in exactly one place.
+import processing
+
 try:
     import mlx_whisper
 except Exception:
@@ -132,6 +136,31 @@ record_start_time = None
 
 _paused        = threading.Event()
 _all_caps_next = False
+
+# ── v1.4: vocabulary, shortcuts, per-app profiles, last-paste tracking ──────
+_vocabulary    = list(_cfg.get("vocabulary", []))
+_shortcuts     = dict(_cfg.get("shortcuts", {}))
+_app_profiles  = dict(_cfg.get("app_profiles", {}))
+_vocab_prompt  = processing.build_vocab_prompt(_vocabulary)
+_last_text     = ""   # last string we pasted (for edit-by-voice)
+
+def _reload_config():
+    """Re-read vocabulary / shortcuts / profiles after the dashboard saves them."""
+    global _vocabulary, _shortcuts, _app_profiles, _vocab_prompt
+    cfg = _load_cfg()
+    _vocabulary   = list(cfg.get("vocabulary", []))
+    _shortcuts    = dict(cfg.get("shortcuts", {}))
+    _app_profiles = dict(cfg.get("app_profiles", {}))
+    _vocab_prompt = processing.build_vocab_prompt(_vocabulary)
+
+def _frontmost_bundle_id():
+    """Bundle id of the app the user is typing into, or None."""
+    try:
+        from AppKit import NSWorkspace
+        app = NSWorkspace.sharedWorkspace().frontmostApplication()
+        return app.bundleIdentifier() if app else None
+    except Exception:
+        return None
 
 # ── Filler words ──────────────────────────────────────────────────────────
 _filler_words = list(_cfg.get("filler_words", ["um", "uh", "hmm", "hm", "er"]))
@@ -195,17 +224,32 @@ VOICE_COMMANDS = {
     "delete that":       "undo",
     "all caps":          "allcaps",
     "caps lock":         "allcaps",
+    # ── Edit-by-voice (operate on the last pasted text) ──
+    "scratch that":       "edit_scratch",
+    "delete last word":   "edit_delword",
+    "delete last sentence": "edit_delsentence",
+    "capitalize that":    "edit_caps",
+    "make it formal":     "edit_formal",
+    "make it casual":     "edit_casual",
 }
 
-def _press_key(key_code, shift=False, cmd=False):
+# Edit commands need the last-pasted text and re-paste, so they're handled
+# separately from the simple keystroke commands in _execute_cmd.
+EDIT_COMMANDS = {
+    "edit_scratch", "edit_delword", "edit_delsentence",
+    "edit_caps", "edit_formal", "edit_casual",
+}
+
+def _press_key(key_code, shift=False, cmd=False, option=False):
     try:
         import Quartz as Q
         src = Q.CGEventSourceCreate(Q.kCGEventSourceStateHIDSystemState)
         dn  = Q.CGEventCreateKeyboardEvent(src, key_code, True)
         up  = Q.CGEventCreateKeyboardEvent(src, key_code, False)
         flags = 0
-        if shift: flags |= Q.kCGEventFlagMaskShift
-        if cmd:   flags |= Q.kCGEventFlagMaskCommand
+        if shift:  flags |= Q.kCGEventFlagMaskShift
+        if cmd:    flags |= Q.kCGEventFlagMaskCommand
+        if option: flags |= Q.kCGEventFlagMaskAlternate
         if flags:
             Q.CGEventSetFlags(dn, flags)
             Q.CGEventSetFlags(up, flags)
@@ -243,6 +287,55 @@ def auto_cleanup(text):
         text = text[0].upper() + text[1:]
     return text
 
+# ── Edit-by-voice ───────────────────────────────────────────────────────────
+def _backspace(n):
+    """Delete n characters to the left of the cursor."""
+    for _ in range(n):
+        _press_key(0x33)  # 0x33 = Delete/Backspace
+        time.sleep(0.004)
+
+def _replace_last(new_text):
+    """Remove the last paste and type the replacement in its place."""
+    global _last_text
+    if not _last_text:
+        return
+    _backspace(len(_last_text))
+    time.sleep(0.03)
+    if pyperclip:
+        pyperclip.copy(new_text)
+        time.sleep(0.05)
+        _paste()
+    _last_text = new_text
+
+def _execute_edit(cmd):
+    """Apply an edit-by-voice command to the last pasted text. No-op if nothing
+    was pasted (e.g. the user clicked elsewhere first)."""
+    global _last_text
+    if not _last_text:
+        _err("Edit command with no last text — ignoring")
+        return
+    if cmd == "edit_scratch":
+        _backspace(len(_last_text))
+        _last_text = ""
+    elif cmd == "edit_delword":
+        # Remove the trailing word from the cursor and from our tracked text.
+        _press_key(0x33, option=True)  # Option+Backspace deletes a word
+        _last_text = re.sub(r"\s*\S+\s*$", "", _last_text)
+    elif cmd == "edit_delsentence":
+        last = re.split(r"(?<=[.!?])\s+", _last_text.strip())
+        chunk = last[-1] if last else _last_text
+        _backspace(len(chunk))
+        _last_text = _last_text[: len(_last_text) - len(chunk)]
+    elif cmd == "edit_caps":
+        _replace_last(_last_text.upper())
+    elif cmd in ("edit_formal", "edit_casual"):
+        mode = "formal" if cmd == "edit_formal" else "casual"
+        new = processing.ai_rewrite(_last_text, mode)
+        if not new:
+            new = (processing.make_formal_fast(_last_text) if mode == "formal"
+                   else processing.make_casual_fast(_last_text))
+        _replace_last(new)
+
 # ── Stdin listener ────────────────────────────────────────────────────────
 def _stdin_listener():
     global _filler_words, _FILLER_RE, _all_caps_next
@@ -259,6 +352,8 @@ def _stdin_listener():
                 words_str = cmd[7:]
                 _filler_words = [w.strip() for w in words_str.split(",") if w.strip()]
                 _FILLER_RE = _build_filler_re(_filler_words)
+            elif cmd == "reload_config":
+                _reload_config()
     except Exception:
         pass
 
@@ -268,7 +363,7 @@ def audio_callback(indata, frames, time_info, status):
         recording_data.append(indata.copy())
 
 def stop_and_transcribe():
-    global is_recording, _all_caps_next
+    global is_recording, _all_caps_next, _last_text
     is_recording = False
     duration = time.time() - (record_start_time or time.time())
 
@@ -286,6 +381,8 @@ def stop_and_transcribe():
     kwargs = dict(path_or_hf_repo=MODEL, verbose=False)
     if LANGUAGE:
         kwargs["language"] = LANGUAGE
+    if _vocab_prompt:
+        kwargs["initial_prompt"] = _vocab_prompt  # bias toward custom words
 
     result = mlx_whisper.transcribe(audio, **kwargs)
     text   = result["text"].strip()
@@ -302,6 +399,8 @@ def stop_and_transcribe():
         _err(f"Voice command: {text!r} → {vcmd}")
         if vcmd == "allcaps":
             _all_caps_next = True
+        elif vcmd in EDIT_COMMANDS:
+            _execute_edit(vcmd)
         else:
             _execute_cmd(vcmd)
         print(f"cmd:{vcmd}", flush=True)
@@ -312,8 +411,22 @@ def stop_and_transcribe():
         text = text.upper()
         _all_caps_next = False
 
-    if CLEANUP:
+    # Expand shortcuts before formatting so expansions are styled consistently.
+    text = processing.apply_shortcuts(text, _shortcuts)
+
+    # Pick the rule for whichever app the user is typing into.
+    profile = processing.get_profile(_app_profiles, _frontmost_bundle_id())
+
+    # cleanup: per-app override of the global CLEANUP toggle.
+    if profile.get("cleanup", CLEANUP):
         text = auto_cleanup(text)
+    tone = profile.get("tone", "none")
+    if tone == "formal":
+        text = processing.make_formal_fast(text)
+    elif tone == "casual":
+        text = processing.make_casual_fast(text)
+    if profile.get("punctuate"):
+        text = processing.punctuate(text)
 
     if text:
         _err(f"Transcribed: {text!r}")
@@ -327,6 +440,7 @@ def stop_and_transcribe():
             pyperclip.copy(text)
         time.sleep(0.1)
         _paste()
+        _last_text = text
         print(f"text:{text}", flush=True)
 
     print("ready", flush=True)
