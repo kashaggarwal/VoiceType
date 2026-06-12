@@ -41,6 +41,10 @@ while i < len(sys.argv):
     else:
         i += 1
 
+# Parakeet (NVIDIA, via parakeet-mlx) is a different engine than Whisper —
+# much faster, but loaded and called through its own API.
+IS_PARAKEET = "parakeet" in MODEL.lower()
+
 # Log errors to file
 _log = open("/tmp/voicetype_worker.log", "w", buffering=1)
 def _err(*args):
@@ -363,7 +367,7 @@ def audio_callback(indata, frames, time_info, status):
         recording_data.append(indata.copy())
 
 def stop_and_transcribe():
-    global is_recording, _all_caps_next, _last_text
+    global is_recording
     is_recording = False
     duration = time.time() - (record_start_time or time.time())
 
@@ -378,14 +382,26 @@ def stop_and_transcribe():
 
     print("transcribing", flush=True)
 
-    kwargs = dict(path_or_hf_repo=MODEL, verbose=False)
-    if LANGUAGE:
-        kwargs["language"] = LANGUAGE
-    if _vocab_prompt:
-        kwargs["initial_prompt"] = _vocab_prompt  # bias toward custom words
+    if IS_PARAKEET:
+        # Parakeet has no prompt biasing, so _vocab_prompt doesn't apply here.
+        with _pk_lock:
+            mel  = _pk_get_logmel(_mx.array(audio), _pk_model.preprocessor_config)
+            text = _pk_model.generate(mel)[0].text.strip()
+    else:
+        kwargs = dict(path_or_hf_repo=MODEL, verbose=False)
+        if LANGUAGE:
+            kwargs["language"] = LANGUAGE
+        if _vocab_prompt:
+            kwargs["initial_prompt"] = _vocab_prompt  # bias toward custom words
+        result = mlx_whisper.transcribe(audio, **kwargs)
+        text   = result["text"].strip()
 
-    result = mlx_whisper.transcribe(audio, **kwargs)
-    text   = result["text"].strip()
+    _deliver(text, duration)
+
+def _deliver(text, duration):
+    """Post-transcription pipeline: noise filter, voice commands, shortcuts,
+    per-app formatting, paste. Shared by the batch and streaming paths."""
+    global _all_caps_next, _last_text
 
     if not text or _is_noise(text):
         _err(f"Skipped (noise/empty): {text!r}")
@@ -445,8 +461,93 @@ def stop_and_transcribe():
 
     print("ready", flush=True)
 
+# ── Streaming transcription (Parakeet) ─────────────────────────────────────
+# Instead of transcribing the whole recording after key release, feed audio
+# to the model in chunks WHILE the user is still speaking. On release only
+# the last ~1s remains to process, so the felt wait is near-constant and
+# small no matter how long the dictation was.
+_pk_lock = threading.Lock()   # MLX model is not thread-safe across sessions
+_session = None
+
+_FEED_INTERVAL = 1.0                      # seconds between feeds while speaking
+_FEED_MIN      = int(0.5 * SAMPLE_RATE)   # don't feed scraps smaller than this
+
+class _StreamSession(threading.Thread):
+    """One recording's streaming transcription. All MLX streaming ops happen
+    on this single thread (incremental state must not hop threads)."""
+
+    def __init__(self, buf):
+        super().__init__(daemon=True)
+        self.buf      = buf            # the recording_data list of THIS recording
+        self.stop_evt = threading.Event()
+        self.duration = 0.0            # set by on_release before stop_evt
+        self.start()
+
+    def finish(self, duration):
+        self.duration = duration
+        self.stop_evt.set()
+
+    def run(self):
+        try:
+            self._stream()
+        except Exception:
+            _err("Streaming failed — falling back to batch:", traceback.format_exc())
+            try:
+                self._batch_fallback()
+            except Exception:
+                _err("Batch fallback FAILED:", traceback.format_exc())
+                print("ready", flush=True)
+
+    def _total_samples(self):
+        return sum(len(c) for c in self.buf)
+
+    def _stream(self):
+        idx, fed, feeds = 0, 0, 0
+        t_feeding = 0.0
+        # depth=1: benchmarked 0.73s compute per 1s of speech (keeps up in real
+        # time); depth=2 took 1.14s per 1s and falls behind while speaking.
+        with _pk_model.transcribe_stream(context_size=(256, 256), depth=1) as stream:
+            while not self.stop_evt.wait(_FEED_INTERVAL):
+                chunks = self.buf[idx:]
+                if sum(len(c) for c in chunks) < _FEED_MIN:
+                    continue
+                idx += len(chunks)
+                t0 = time.time()
+                with _pk_lock:
+                    stream.add_audio(_mx.array(np.concatenate(chunks).flatten()))
+                t_feeding += time.time() - t0
+                fed += sum(len(c) for c in chunks)
+                feeds += 1
+
+            # key released — drop too-short recordings (matches batch path)
+            if self._total_samples() < SAMPLE_RATE * 0.3:
+                print("ready", flush=True)
+                return
+
+            t0 = time.time()
+            chunks = self.buf[idx:]
+            with _pk_lock:
+                if chunks:
+                    stream.add_audio(_mx.array(np.concatenate(chunks).flatten()))
+                text = stream.result.text.strip()
+            tail = time.time() - t0
+
+        _err(f"Streaming: {feeds} feeds ({t_feeding:.2f}s) while speaking, "
+             f"tail wait {tail:.2f}s for {self._total_samples()/SAMPLE_RATE:.1f}s audio")
+        _deliver(text, self.duration)
+
+    def _batch_fallback(self):
+        audio = np.concatenate(self.buf, axis=0).flatten() if self.buf else np.zeros(0)
+        if len(audio) < SAMPLE_RATE * 0.3:
+            print("ready", flush=True)
+            return
+        with _pk_lock:
+            mel  = _pk_get_logmel(_mx.array(audio), _pk_model.preprocessor_config)
+            text = _pk_model.generate(mel)[0].text.strip()
+        _deliver(text, self.duration)
+
 def on_press(key):
-    global is_recording, recording_data, record_start_time
+    global is_recording, recording_data, record_start_time, _session
     if _paused.is_set():
         return
     if key == RECORD_KEY and not is_recording:
@@ -454,38 +555,138 @@ def on_press(key):
         recording_data    = []
         record_start_time = time.time()
         print("recording", flush=True)
+        if IS_PARAKEET:
+            try:
+                _session = _StreamSession(recording_data)
+            except Exception:
+                _err("Could not start stream session:", traceback.format_exc())
+                _session = None   # on_release falls back to batch
+
+def _safe_transcribe():
+    """Run a transcription; on ANY failure, log it and report ready so the
+    menubar never sticks on 'transcribing'."""
+    try:
+        stop_and_transcribe()
+    except Exception:
+        _err("Transcription FAILED:", traceback.format_exc())
+        print("ready", flush=True)
 
 def on_release(key):
+    global is_recording, _session
     if key == RECORD_KEY and is_recording:
-        threading.Thread(target=stop_and_transcribe, daemon=True).start()
+        if IS_PARAKEET and _session is not None:
+            is_recording = False
+            print("transcribing", flush=True)
+            _session.finish(time.time() - (record_start_time or time.time()))
+            _session = None
+        else:
+            threading.Thread(target=_safe_transcribe, daemon=True).start()
 
 # ── Load model ────────────────────────────────────────────────────────────
-if mlx_whisper is None:
+if not IS_PARAKEET and mlx_whisper is None:
     _err("Cannot start — mlx_whisper failed to import.")
     sys.exit(1)
 
 try:
     print("loading", flush=True)
     _err("Loading model...")
-    kwargs = dict(path_or_hf_repo=MODEL, verbose=False)
-    if LANGUAGE:
-        kwargs["language"] = LANGUAGE
-    mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), **kwargs)
+    if IS_PARAKEET:
+        import mlx.core as _mx
+        from parakeet_mlx import from_pretrained as _pk_from_pretrained
+        from parakeet_mlx.audio import get_logmel as _pk_get_logmel
+        _pk_model = _pk_from_pretrained(MODEL)
+        # Force-evaluate every weight NOW, in this thread. MLX loads weights
+        # lazily, and a lazy array first evaluated from another thread crashes
+        # with "There is no Stream(gpu, 0) in current thread" — which is
+        # exactly what transcription threads would hit on the decoder's
+        # embedding (silence warmup never touches it).
+        from mlx.utils import tree_flatten as _tree_flatten
+        _mx.eval([v for _, v in _tree_flatten(_pk_model.parameters())])
+        # Warm up so the first real dictation doesn't pay MLX compile time.
+        _pk_model.generate(_pk_get_logmel(
+            _mx.array(np.zeros(SAMPLE_RATE, dtype=np.float32)),
+            _pk_model.preprocessor_config))
+        # Warm up the streaming path too — its kernels compile separately,
+        # and the first-ever add_audio once hit a Metal alloc underflow in
+        # the library (seen 2026-06-12). Absorb both here, not on the
+        # user's first dictation. Non-fatal: streaming falls back to batch.
+        try:
+            with _pk_model.transcribe_stream(context_size=(256, 256), depth=1) as _ws:
+                _ws.add_audio(_mx.array(np.zeros(SAMPLE_RATE, dtype=np.float32)))
+                _ws.add_audio(_mx.array(np.zeros(SAMPLE_RATE // 2, dtype=np.float32)))
+                _ = _ws.result.text
+            del _ws
+        except Exception:
+            _err("Streaming warmup failed (non-fatal):", traceback.format_exc())
+    else:
+        kwargs = dict(path_or_hf_repo=MODEL, verbose=False)
+        if LANGUAGE:
+            kwargs["language"] = LANGUAGE
+        mlx_whisper.transcribe(np.zeros(SAMPLE_RATE, dtype=np.float32), **kwargs)
     _err("Model ready")
     print("ready", flush=True)
 except Exception:
     _err("Model load FAILED:", traceback.format_exc())
     sys.exit(1)
 
-try:
-    stream = sd.InputStream(
+def _open_stream():
+    s = sd.InputStream(
         samplerate=SAMPLE_RATE, channels=1,
         dtype="float32", callback=audio_callback
     )
-    stream.start()
+    s.start()
+    return s
+
+def _start_stream_with_recovery():
+    """Open the mic stream, self-healing the macOS CoreAudio input wedge.
+
+    PaErrorCode -9986 ("Audio Hardware Not Running") means the system-wide
+    CoreAudio *input* path is stuck: output keeps working but every input
+    client fails, often after a Continuity iPhone-mic glitch. Permissions
+    and our code are fine — only restarting coreaudiod clears it. So after
+    plain retries we ask the user (admin prompt) to restart coreaudiod,
+    then retry once more.
+    """
+    last_exc = None
+    for attempt in range(3):
+        try:
+            return _open_stream()
+        except sd.PortAudioError as e:
+            last_exc = e
+            _err(f"Audio stream attempt {attempt + 1} failed: {e}")
+            time.sleep(1 + attempt)
+    if "-9986" in str(last_exc):
+        _err("CoreAudio input wedged (-9986) — asking user to restart coreaudiod")
+        rc = _subprocess.run(
+            ["osascript", "-e",
+             'do shell script "killall coreaudiod" '
+             'with prompt "VoiceType: the macOS microphone system (coreaudiod) '
+             'is stuck and needs a restart to fix dictation." '
+             'with administrator privileges'],
+            capture_output=True).returncode
+        if rc == 0:
+            time.sleep(3)
+            for attempt in range(3):
+                try:
+                    return _open_stream()
+                except sd.PortAudioError as e:
+                    last_exc = e
+                    time.sleep(1 + attempt)
+        else:
+            _err("User declined (or osascript failed) — coreaudiod not restarted")
+    raise last_exc
+
+try:
+    stream = _start_stream_with_recovery()
     _err("Audio stream started")
 except Exception:
     _err("Audio stream FAILED:", traceback.format_exc())
+    _subprocess.run(
+        ["osascript", "-e",
+         'display notification "Microphone could not be started — '
+         'run: sudo killall coreaudiod  (details in /tmp/voicetype_worker.log)" '
+         'with title "VoiceType"'],
+        capture_output=True)
     sys.exit(1)
 
 threading.Thread(target=_stdin_listener, daemon=True).start()

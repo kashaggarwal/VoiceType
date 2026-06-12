@@ -64,7 +64,7 @@ _STATS_PATH = os.path.expanduser("~/.voicetype/stats.json")
 
 # Single source of truth for the app version shown in the dashboard.
 # release.sh keeps this in sync with the git tag / app bundle version.
-VERSION = "1.4"
+VERSION = "1.5"
 
 def _load_daily_stats():
     try:
@@ -1052,9 +1052,7 @@ HTML_TEMPLATE = """<!DOCTYPE html>
               <div class="settings-row-sub">Faster = quicker results · Accurate = better quality</div>
             </div>
             <select id="model-select" onchange="handleModel()">
-              <option value="mlx-community/whisper-small-mlx" selected>Small — fast (~4s) ✦</option>
-              <option value="mlx-community/whisper-medium-mlx">Medium — balanced (~10s)</option>
-              <option value="mlx-community/whisper-large-v3-mlx">Large v3 — best quality (~20s)</option>
+              __MODEL_OPTIONS__
             </select>
           </div>
         </div>
@@ -1697,11 +1695,15 @@ class _MessageHandler(NSObject):
                 self._db.on_stop()
         elif action == "model":
             model_id = body.get("model_id", "")
-            if model_id and self._db.on_model_change:
-                self._db.on_model_change(model_id)
+            if model_id:
+                self._db.current_model = model_id
+                _save_config_key("model", model_id)
+                if self._db.on_model_change:
+                    self._db.on_model_change(model_id)
         elif action == "language":
             code = body.get("code", "en")
             self._db.current_lang = code
+            _save_config_key("language", code)
             if self._db.on_language_change:
                 self._db.on_language_change(code)
         elif action == "clear":
@@ -1825,6 +1827,24 @@ def _build_lang_options(current="en"):
     return "\n".join(opts)
 
 
+MODELS = [
+    ("mlx-community/parakeet-tdt-0.6b-v3", "Parakeet — fastest ⚡ (English + EU languages)"),
+    ("mlx-community/whisper-small-mlx",    "Small — fast, all languages ✦"),
+    ("mlx-community/whisper-medium-mlx",   "Medium — balanced (~10s)"),
+    ("mlx-community/whisper-large-v3-mlx", "Large v3 — best quality (~20s)"),
+]
+
+DEFAULT_MODEL = "mlx-community/whisper-small-mlx"
+
+
+def _build_model_options(current=DEFAULT_MODEL):
+    opts = []
+    for repo, label in MODELS:
+        sel = ' selected' if repo == current else ''
+        opts.append(f'<option value="{repo}"{sel}>{label}</option>')
+    return "\n".join(opts)
+
+
 def _build_lang_map():
     pairs = []
     for name, code in LANGUAGES:
@@ -1941,7 +1961,9 @@ class Dashboard:
         self.count_today = 0
         self.total_words = 0
         self.is_enabled  = False
-        self.current_lang = "en"
+        # Restore the user's last language/model choice across launches.
+        self.current_lang  = _load_config_key("language", "en")
+        self.current_model = _load_config_key("model", DEFAULT_MODEL)
 
         # Persistent per-day word counts
         self._daily_stats = _load_daily_stats()
@@ -2567,6 +2589,7 @@ class Dashboard:
                 .replace("__VOCAB__", json.dumps(self.vocabulary))
                 .replace("__SHORTCUTS__", json.dumps(self.shortcuts))
                 .replace("__PROFILES__", json.dumps(self.app_profiles))
+                .replace("__MODEL_OPTIONS__", _build_model_options(self.current_model))
                 .replace("__VERSION__", VERSION))
 
         self._handler = _MessageHandler.alloc().initWithDashboard_(self)

@@ -46,8 +46,17 @@ is_enabled    = False
 is_paused     = False
 worker        = None
 icon_obj      = None
-current_lang  = "en"
-current_model = "mlx-community/whisper-small-mlx"
+def _cfg_get(key, default):
+    """Read one key from the shared config (the dashboard saves choices there)."""
+    try:
+        import json
+        with open(os.path.expanduser("~/.voicetype/config.json")) as f:
+            return json.load(f).get(key, default)
+    except Exception:
+        return default
+
+current_lang  = _cfg_get("language", "en")
+current_model = _cfg_get("model", "mlx-community/whisper-small-mlx")
 _last_state   = "off"
 
 
